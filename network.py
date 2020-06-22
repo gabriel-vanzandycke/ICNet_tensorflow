@@ -22,10 +22,8 @@ def layer(op):
             layer_input = self.terminals[0]
         else:
             layer_input = list(self.terminals)
-
         # Perform the operation and get the output.
         layer_output = op(self, layer_input, *args, **kwargs)
-
         # Add to layer LUT.
         self.layers[name] = layer_output
         layer_name.append(name)
@@ -49,7 +47,7 @@ class Network(object):
         self.trainable = trainable
 
         # Switch variable for dropout
-        self.use_dropout = tf.compat.v1.placeholder_with_default(tf.constant(1.0),
+        self.use_dropout = tf.placeholder_with_default(tf.constant(1.0),
                                                        shape=[],
                                                        name='use_dropout')
         self.filter_scale = cfg.filter_scale
@@ -59,7 +57,7 @@ class Network(object):
 
         self.setup()
 
-    def setup(self):
+    def setup(self, is_training):
         '''Construct the network. '''
         raise NotImplementedError('Must be implemented by the subclass.')
 
@@ -102,7 +100,7 @@ class Network(object):
         '''
         data_dict = np.load(data_path, encoding='latin1').item()
         for op_name in data_dict:
-            with tf.compat.v1.variable_scope(op_name, reuse=True):
+            with tf.variable_scope(op_name, reuse=True):
                 for param_name, data in data_dict[op_name].items():
                     try:
                         if 'bn' in op_name:
@@ -142,7 +140,7 @@ class Network(object):
 
     def make_var(self, name, shape):
         '''Creates a new TensorFlow variable.'''
-        return tf.compat.v1.get_variable(name, shape, trainable=self.trainable)
+        return tf.get_variable(name, shape, trainable=self.trainable)
 
     def get_layer_name(self):
         return layer_name
@@ -176,7 +174,7 @@ class Network(object):
             c_o *= self.filter_scale
 
         convolve = lambda i, k: tf.nn.conv2d(i, k, [1, s_h, s_w, 1], padding=padding,data_format=DEFAULT_DATAFORMAT)
-        with tf.compat.v1.variable_scope(name) as scope:
+        with tf.variable_scope(name) as scope:
             kernel = self.make_var('weights', shape=[k_h, k_w, c_i, c_o])
             output = convolve(input, kernel)
 
@@ -234,14 +232,34 @@ class Network(object):
     @layer
     def avg_pool(self, input, k_h, k_w, s_h, s_w, name, padding=DEFAULT_PADDING):
         self.validate_padding(padding)
-
-        output = tf.nn.avg_pool(input,
+        return tf.nn.avg_pool(input,
                               ksize=[1, k_h, k_w, 1],
                               strides=[1, s_h, s_w, 1],
                               padding=padding,
                               name=name,
                               data_format=DEFAULT_DATAFORMAT)
-        return output
+
+    @layer
+    def avg_spp(self, input, size, name, padding=DEFAULT_PADDING):
+        eye = tf.eye(size*size, batch_shape=(tf.shape(input)[0],))           # identity matrix   [B, s*s, s*s]
+        mask = tf.reshape(eye, (-1, size, size, size*size))                  # simple mask       [B, s, s, s*s]
+        mask = tf.image.resize_nearest_neighbor(mask, tf.shape(input)[1:3])  # full mask         [B, H, W, s*s]
+        spp = tf.multiply(tf.expand_dims(input, 4), tf.expand_dims(mask, 3)) # splitted image    [B, H, W, C, s*s]
+        spp = tf.reduce_mean(spp, axis=[1,2])*size*size                      # average           [B, 1, 1, C, s*s]
+        spp = tf.reshape(spp, (-1, tf.shape(input)[3], size, size))          # reshaping         [B, C, s, s]
+        spp = tf.transpose(spp, [0,2,3,1], name=name)                        # transposing       [B, s, s, C]
+        return spp
+
+    @layer
+    def max_spp(self, input, size, name, padding=DEFAULT_PADDING):
+        eye = tf.eye(size*size, batch_shape=(tf.shape(input)[0],))
+        mask = tf.reshape(eye, (-1, size, size, size*size))
+        mask = tf.image.resize_nearest_neighbor(mask, tf.shape(input)[1:3])
+        spp = tf.multiply(tf.expand_dims(input, 4), tf.expand_dims(mask, 3))
+        spp = tf.reduce_max(spp, axis=[1,2])
+        spp = tf.reshape(spp, (-1, tf.shape(input)[3], size, size))
+        spp = tf.transpose(spp, [0,2,3,1], name=name)
+        return spp
 
     @layer
     def lrn(self, input, radius, alpha, beta, name, bias=1.0):
@@ -293,7 +311,7 @@ class Network(object):
 
     @layer
     def batch_normalization(self, input, name, scale_offset=True, relu=False):
-        output = tf.compat.v1.layers.batch_normalization(
+        output = tf.layers.batch_normalization(
                     input,
                     momentum=0.95,
                     epsilon=1e-5,
@@ -317,13 +335,21 @@ class Network(object):
 
     @layer
     def interp(self, input, s_factor=1, z_factor=1, name=None):
-        ori_h, ori_w = input.get_shape().as_list()[1:3]
+        shape = input.get_shape().as_list() if input.get_shape().as_list()[1] is not None else tf.cast(tf.shape(input), tf.float32)
+        ori_h, ori_w = shape[1], shape[2]
+        # raise
+        # #ori_h = input.get_shape().as_list()[1]
+        # #ori_w = input.get_shape().as_list()[2]
+        
+        # ori_h = tf.cast(tf.shape(input)[1], tf.float32)
+        # ori_w = tf.cast(tf.shape(input)[2], tf.float32)
+
         # shrink
         ori_h = (ori_h - 1) * s_factor + 1
         ori_w = (ori_w - 1) * s_factor + 1
         # zoom
         ori_h = ori_h + (ori_h - 1) * (z_factor - 1)
         ori_w = ori_w + (ori_w - 1) * (z_factor - 1)
-        resize_shape = [int(ori_h), int(ori_w)]
+        resize_shape = [tf.cast(ori_h, tf.int32), tf.cast(ori_w, tf.int32)]
 
         return tf.image.resize_bilinear(input, size=resize_shape, align_corners=True, name=name)
